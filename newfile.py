@@ -5,6 +5,25 @@ import telebot
 from collections import Counter
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from yt_dlp import YoutubeDL
+from threading import Thread
+from flask import Flask
+
+# --- Mini serveur Flask pour maintenir Render en ligne ---
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot actif 24/7 !"
+
+def run():
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
+
+def keep_alive():
+    t = Thread(target=run)
+    t.start()
+
+keep_alive()
+# --------------------------------------------------------
 
 TOKEN = "8803716438:AAFlRRA1sTLj8DlM57EAVYRHXvaGKFCiIE0"
 
