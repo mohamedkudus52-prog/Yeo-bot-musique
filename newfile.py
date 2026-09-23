@@ -25,7 +25,7 @@ def keep_alive():
 keep_alive()
 # --------------------------------------------------------
 
-TOKEN = "8803716438:AAFlRRA1sTLj8DlM57EAVYRHXvaGKFCiIE0"
+TOKEN = "8803716438:AAGesgLwzKNOt1VGFER90wkFWypPdr6GmQk"
 
 # Initialisation TeleBot
 bot = telebot.TeleBot(TOKEN)
