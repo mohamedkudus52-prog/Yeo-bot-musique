@@ -1,105 +1,305 @@
 import os
+import time
+import urllib.request
 import telebot
-from flask import Flask, render_template_string
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
+from collections import Counter
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from yt_dlp import YoutubeDL
+from threading import Thread
+from flask import Flask
 
-# Configuration de ton token (on récupère celui que tu as mis en place)
-TOKEN = "8803716438:AAGesgLwzKNOt1VGFER90wkFWypPdr6GmQk"
-bot = telebot.TeleBot(TOKEN)
-app = Flask(__name__)
+# --- Mini serveur Flask pour maintenir Render en ligne ---
+app = Flask('')
 
-# Route Flask qui héberge l'interface style "Liquid Glass"
 @app.route('/')
 def home():
-    return render_template_string("""
-    <!DOCTYPE html>
-    <html lang="fr" class="dark">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Abdoul Yeo Music</title>
-        <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
-        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-        <style>
-            /* Style effet verre liquide (Glassmorphism) */
-            .glass-card {
-                background: rgba(255, 255, 255, 0.05);
-                backdrop-filter: blur(25px);
-                -webkit-backdrop-filter: blur(25px);
-                border: 1px solid rgba(255, 255, 255, 0.1);
-                box-shadow: 0 20px 40px rgba(0, 0, 0, 0.4);
-            }
-            .glass-input {
-                background: rgba(0, 0, 0, 0.3);
-                backdrop-filter: blur(10px);
-                border: 1px solid rgba(255, 255, 255, 0.08);
-            }
-        </style>
-    </head>
-    <body class="bg-gradient-to-br from-neutral-950 via-purple-950/40 to-neutral-950 text-neutral-100 min-h-screen flex flex-col items-center justify-center p-4 selection:bg-purple-500 selection:text-white">
+    return "Bot actif 24/7 !"
 
-        <div class="glass-card rounded-[32px] p-6 max-w-sm w-full space-y-6 text-center relative overflow-hidden">
-            
-            <div class="absolute -top-24 -left-24 w-48 h-48 bg-purple-600/30 rounded-full blur-3xl pointer-events-none"></div>
-            <div class="absolute -bottom-24 -right-24 w-48 h-48 bg-pink-600/20 rounded-full blur-3xl pointer-events-none"></div>
+def run():
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
 
-            <div class="relative mx-auto w-20 h-20">
-                <div class="absolute inset-0 bg-gradient-to-tr from-purple-600 to-pink-500 rounded-2xl blur-md opacity-75"></div>
-                <div class="relative w-20 h-20 bg-neutral-900 border border-white/20 rounded-2xl flex items-center justify-center text-2xl text-white shadow-xl">
-                    <i class="fa-solid fa-music"></i>
-                </div>
-            </div>
+def keep_alive():
+    t = Thread(target=run)
+    t.start()
 
-            <div class="space-y-1">
-                <h1 class="font-bold text-xl tracking-tight text-white flex items-center justify-center gap-1.5">
-                    𝔄𝔟𝔡𝔬𝔲𝔩 𝔜𝔢𝔬 𝔐𝔲𝔰𝔦𝔠 <i class="fa-solid fa-circle-check text-xs text-blue-400"></i>
-                </h1>
-                <p class="text-xs text-neutral-400 font-medium">Lecteur & Téléchargeur de musique</p>
-            </div>
+keep_alive()
+# --------------------------------------------------------
 
-            <div class="relative">
-                <span class="absolute inset-y-0 left-0 flex items-center pl-4 pointer-events-none text-neutral-400">
-                    <i class="fa-solid fa-magnifying-glass text-xs"></i>
-                </span>
-                <input type="text" id="searchQuery" placeholder="Rechercher un titre ou un artiste..." class="glass-input w-full rounded-2xl pl-10 pr-4 py-3.5 text-xs text-white placeholder-neutral-500 focus:outline-none focus:border-purple-500/80 transition shadow-inner">
-            </div>
+TOKEN = "8803716438:AAGesgLwzKNOt1VGFER90wkFWypPdr6GmQk"
 
-            <button onclick="launchSearch()" class="w-full bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-500 hover:to-pink-500 text-white font-semibold py-3.5 rounded-2xl text-xs transition duration-300 shadow-lg shadow-purple-600/30 flex items-center justify-center gap-2">
-                <i class="fa-solid fa-download"></i> Lancer le téléchargement
-            </button>
+# Initialisation TeleBot
+bot = telebot.TeleBot(TOKEN)
 
-            <p class="text-[10px] text-neutral-500 tracking-wider uppercase">Propulsé par Render & Telegram</p>
-        </div>
+prenoms_utilisateurs = {}
+etats_utilisateurs = {}
+historique_artistes = {}
+compteur_recherches = {}
 
-        <script>
-            function launchSearch() {
-                const query = document.getElementById('searchQuery').value;
-                if(query.trim() !== "") {
-                    alert("Recherche de : " + query + " en cours...");
-                } else {
-                    alert("Veuillez entrer un nom de musique !");
-                }
-            }
-        </script>
-    </body>
-    </html>
-    """)
+@bot.message_handler(commands=['start'])
+def message_bienvenue(message):
+    chat_id = message.chat.id
+    etats_utilisateurs[chat_id] = "attente_nom"
+    bot.send_message(
+        chat_id, 
+        "👋 **Bienvenue sur ton assistant musical IA !**\n\nComment dois-je t'appeler ?",
+        parse_mode="Markdown"
+    )
 
-# Commande Telegram pour ouvrir la Mini App avec le style Glass
-@bot.message_handler(commands=['app', 'musique', 'start'])
-def send_web_app(message):
-    markup = InlineKeyboardMarkup()
-    # ⚠️ IMPORTANT : Remplace "https://ton-app.onrender.com" par l'URL exacte de ton site web Render
-    web_app_url = "https://yeo-bot-musique.onrender.com" 
-    markup.add(InlineKeyboardButton("✨ Ouvrir le lecteur Glass", web_app=WebAppInfo(url=web_app_url)))
+@bot.message_handler(func=lambda message: True)
+def gestion_messages(message):
+    chat_id = message.chat.id
+    texte_recu = message.text.strip()
     
-    bot.send_message(message.chat.id, "🎶 **Bienvenue sur ton interface musicale !**\n\nClique sur le bouton ci-dessous pour ouvrir ton application avec un design ultra-stylé :", reply_markup=markup, parse_mode="Markdown")
+    # Sécurité anti-boucle pour /start
+    if texte_recu.startswith('/start'):
+        return
 
-# Lancement du serveur Flask et du Bot en arrière-plan
-if __name__ == "__main__":
-    import threading
-    # Lancement du bot dans un fil séparé pour ne pas bloquer Flask
-    threading.Thread(target=lambda: bot.infinity_polling(none_stop=True)).start()
-    # Lancement de Flask sur le port requis par Render
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    # Capture du prénom
+    if etats_utilisateurs.get(chat_id) == "attente_nom":
+        prenoms_utilisateurs[chat_id] = texte_recu
+        etats_utilisateurs[chat_id] = "actif"
+        historique_artistes[chat_id] = []
+        compteur_recherches[chat_id] = 0
+        
+        bot.send_message(
+            chat_id, 
+            f"Enchanté **{texte_recu}** ! 🎧\nEnvoyez-moi le nom d'un titre, d'un album ou d'un artiste.",
+            parse_mode="Markdown"
+        )
+        return
+
+    nom_user = prenoms_utilisateurs.get(chat_id, message.from_user.first_name)
+    bot.send_chat_action(chat_id, 'upload_document')
+
+    # CAS 1 : Recherche explicite d'albums
+    if "album" in texte_recu.lower():
+        rechercher_3_derniers_albums(chat_id, nom_user, texte_recu)
+        return
+
+    # CAS 2 : Recherche de morceau individuel
+    msg_patienter = bot.send_message(
+        chat_id, 
+        f"⚡ *Analyse & téléchargement pour {nom_user}...*", 
+        parse_mode="Markdown"
+    )
+    
+    options = {
+        'format': 'bestaudio[ext=m4a]/bestaudio/best',
+        'default_search': 'ytsearch1:',
+        'outtmpl': '%(id)s.%(ext)s',
+        'nopart': True,
+        'quiet': True,
+        'no_warnings': True,
+        'noplaylist': True,
+        'writethumbnail': True
+    }
+    
+    fichier_telecharge = None
+    pochette_img = None
+    try:
+        with YoutubeDL(options) as ydl:
+            info = ydl.extract_info(texte_recu, download=True)
+            
+            if not info or ('entries' in info and not info['entries']):
+                bot.delete_message(chat_id, msg_patienter.message_id)
+                bot.send_message(
+                    chat_id, 
+                    f"⚠️ Oups **{nom_user}**, aucun titre trouvé. Vérifie l'orthographe !",
+                    parse_mode="Markdown"
+                )
+                return
+
+            if 'entries' in info and info['entries']:
+                info_piste = info['entries'][0]
+            else:
+                info_piste = info
+
+            fichier_telecharge = ydl.prepare_filename(info_piste)
+            titre_chanson = info_piste.get('title', texte_recu)
+            nom_artiste = info_piste.get('artist', info_piste.get('uploader', 'Artiste Inconnu'))
+            nom_album = info_piste.get('album', None)
+
+            # Pochette d'album HD
+            thumb_url = info_piste.get('thumbnail', None)
+            if thumb_url:
+                pochette_img = f"{info_piste['id']}.jpg"
+                try:
+                    urllib.request.urlretrieve(thumb_url, pochette_img)
+                except Exception:
+                    pochette_img = None
+
+        if chat_id not in historique_artistes:
+            historique_artistes[chat_id] = []
+            compteur_recherches[chat_id] = 0
+            
+        historique_artistes[chat_id].append(nom_artiste)
+        compteur_recherches[chat_id] += 1
+
+        markup = InlineKeyboardMarkup()
+        url_paroles = f"https://www.google.com/search?q=paroles+{titre_chanson.replace(' ', '+')}"
+        markup.add(InlineKeyboardButton("📄 Paroles", url=url_paroles))
+
+        markup.add(InlineKeyboardButton(
+            f"💿 Chercher les albums de {nom_artiste[:15]}", 
+            callback_data=f"listalbums_{nom_artiste[:25]}"
+        ))
+
+        caption_texte = f"🎵 **{titre_chanson}**\n👤 **Artiste :** {nom_artiste}"
+        if nom_album:
+            caption_texte += f"\n💿 **Album :** {nom_album}"
+
+        with open(fichier_telecharge, 'rb') as audio:
+            if pochette_img and os.path.exists(pochette_img):
+                with open(pochette_img, 'rb') as thumb:
+                    bot.send_audio(
+                        chat_id, audio, title=titre_chanson, performer=nom_artiste,
+                        caption=caption_texte, parse_mode="Markdown", reply_markup=markup,
+                        thumb=thumb
+                    )
+            else:
+                bot.send_audio(
+                    chat_id, audio, title=titre_chanson, performer=nom_artiste,
+                    caption=caption_texte, parse_mode="Markdown", reply_markup=markup
+                )
+            
+        bot.delete_message(chat_id, msg_patienter.message_id)
+
+    except Exception as e:
+        if msg_patienter:
+            try:
+                bot.delete_message(chat_id, msg_patienter.message_id)
+            except Exception:
+                pass
+        bot.send_message(
+            chat_id, 
+            f"❌ **{nom_user}**, titre introuvable ou erreur de saisie. Réessaie avec le nom exact !", 
+            parse_mode="Markdown"
+        )
+    
+    finally:
+        if fichier_telecharge and os.path.exists(fichier_telecharge):
+            try:
+                os.remove(fichier_telecharge)
+            except Exception:
+                pass
+        if pochette_img and os.path.exists(pochette_img):
+            try:
+                os.remove(pochette_img)
+            except Exception:
+                pass
+
+# Recherche des 3 derniers albums
+def rechercher_3_derniers_albums(chat_id, nom_user, requete):
+    msg = bot.send_message(chat_id, f"🔎 *Recherche des albums pour {nom_user}...*", parse_mode="Markdown")
+    
+    options_recherche = {
+        'extract_flat': True,
+        'skip_download': True,
+        'default_search': f'ytsearch3:{requete} full album',
+        'quiet': True
+    }
+    
+    try:
+        with YoutubeDL(options_recherche) as ydl:
+            info = ydl.extract_info(f"{requete} full album", download=False)
+            entries = info.get('entries', []) if info else []
+            
+            if not entries:
+                bot.delete_message(chat_id, msg.message_id)
+                bot.send_message(chat_id, f"⚠️ Aucun album trouvé pour : *{requete}*", parse_mode="Markdown")
+                return
+
+            markup = InlineKeyboardMarkup()
+            for idx, entry in enumerate(entries[:3], 1):
+                titre_album = entry.get('title', f'Album {idx}')
+                nom_clean = titre_album.replace('Full Album', '').replace('Album', '').strip()[:35]
+                # On stocke le titre complet nettoyé dans le callback_data (limité à 64 octets max pour Telegram)
+                callback_payload = nom_clean[:50]
+                markup.add(InlineKeyboardButton(
+                    f"💿 {nom_clean}", 
+                    callback_data=f"dlalbum_{callback_payload}"
+                ))
+
+            bot.delete_message(chat_id, msg.message_id)
+            bot.send_message(
+                chat_id, 
+                f"💿 **Voici les albums trouvés pour {nom_user} :**\nClique sur celui que tu veux télécharger :",
+                parse_mode="Markdown",
+                reply_markup=markup
+            )
+    except Exception as e:
+        bot.send_message(chat_id, f"⚠️ Erreur lors de la recherche des albums : {str(e)}")
+
+# Callbacks
+@bot.callback_query_handler(func=lambda call: call.data.startswith('listalbums_'))
+def callback_liste_albums(call):
+    chat_id = call.message.chat.id
+    nom_user = prenoms_utilisateurs.get(chat_id, call.from_user.first_name)
+    artiste = call.data.replace('listalbums_', '')
+    bot.answer_callback_query(call.id, "Recherche des albums...")
+    rechercher_3_derniers_albums(chat_id, nom_user, f"album {artiste}")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('dlalbum_'))
+def callback_telecharger_album_selectionne(call):
+    chat_id = call.message.chat.id
+    nom_user = prenoms_utilisateurs.get(chat_id, call.from_user.first_name)
+    target_album = call.data.replace('dlalbum_', '')
+    
+    bot.answer_callback_query(call.id, "Téléchargement de l'album en cours...")
+    msg = bot.send_message(chat_id, f"💿 *Téléchargement de l'album '{target_album}'...*", parse_mode="Markdown")
+    
+    options_dl = {
+        'format': 'bestaudio[ext=m4a]/bestaudio/best',
+        'default_search': f'ytsearch5:{target_album} playlist',
+        'outtmpl': '%(id)s.%(ext)s',
+        'quiet': True,
+        'noplaylist': False
+    }
+    
+    try:
+        with YoutubeDL(options_dl) as ydl:
+            info = ydl.extract_info(f"{target_album} album songs", download=True)
+            entries = info.get('entries', []) if info else []
+
+            if not entries:
+                bot.delete_message(chat_id, msg.message_id)
+                bot.send_message(chat_id, f"⚠️ Impossible de récupérer les pistes de cet album.", parse_mode="Markdown")
+                return
+
+            count_envoyes = 0
+            for index, entry in enumerate(entries[:5], 1): # Limité à 5 pistes principales pour éviter le timeout
+                if not entry:
+                    continue
+                f_path = ydl.prepare_filename(entry)
+                titre = entry.get('title', f"Piste {index}")
+
+                if os.path.exists(f_path):
+                    try:
+                        with open(f_path, 'rb') as audio:
+                            bot.send_audio(chat_id, audio, title=titre, caption=f"💿 **Piste #{index}** - {titre}", parse_mode="Markdown")
+                        count_envoyes += 1
+                    except Exception:
+                        pass
+                    finally:
+                        if os.path.exists(f_path):
+                            os.remove(f_path)
+                    
+        bot.delete_message(chat_id, msg.message_id)
+        bot.send_message(chat_id, f"✅ {count_envoyes} pistes envoyées avec succès pour **{nom_user}** !", parse_mode="Markdown")
+        
+    except Exception as e:
+        if msg:
+            try:
+                bot.delete_message(chat_id, msg.message_id)
+            except Exception:
+                pass
+        bot.send_message(chat_id, f"⚠️ Erreur lors du téléchargement de l'album : {str(e)}")
+
+# Boucle principale d'exécution sécurisée contre le conflit 409
+while True:
+    try:
+        print("Démarrage du bot Telegram...")
+        bot.infinity_polling(timeout=30, long_polling_timeout=20, skip_pending=True)
+    except Exception as e:
+        print(f"Erreur de polling : {e}")
+        time.sleep(5)
