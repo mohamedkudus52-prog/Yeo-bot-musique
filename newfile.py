@@ -18,7 +18,6 @@ convertir l'audio en M4A et fusionner les formats vidéo si nécessaire.
 """
 
 import html
-import io
 import logging
 import os
 import re
@@ -26,7 +25,8 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from tempfile import TemporaryDirectory
+from tempfile import mkdtemp
+import shutil
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -579,122 +579,62 @@ def inspect_duration(ydl_options, target):
 
 
 def download_audio(query):
-    with TemporaryDirectory(prefix="music_") as folder:
-        target = f"ytsearch1:{query}"
-
-        try:
-            preview = inspect_duration(
-                ydl_audio_opts(folder),
-                target,
-            )
-
-            with YoutubeDL(ydl_audio_opts(folder)) as ydl:
-                info = ydl.extract_info(
-                    target,
-                    download=True,
-                )
-
-        except DownloadError as exc:
-            raise RuntimeError(
-                "Le service vidéo n'a pas pu récupérer ce titre "
-                "pour le moment."
-            ) from exc
-
+    folder = mkdtemp(prefix="music_")
+    target = f"ytsearch1:{query}"
+    try:
+        preview = inspect_duration(ydl_audio_opts(folder), target)
+        with YoutubeDL(ydl_audio_opts(folder)) as ydl:
+            info = ydl.extract_info(target, download=True)
         if info and info.get("entries"):
-            info = next(
-                (entry for entry in info["entries"] if entry),
-                preview,
-            )
-
-        path = find_media(
-            folder,
-            AUDIO_EXTS,
-        )
-
+            info = next((entry for entry in info["entries"] if entry), preview)
+        path = find_media(folder, AUDIO_EXTS)
         if not path:
-            raise RuntimeError(
-                "Le fichier audio n'a pas été produit."
-            )
-
+            raise RuntimeError("Le fichier audio n'a pas été produit.")
         size = os.path.getsize(path)
-
         if size > MAX_FILE_BYTES:
-            raise RuntimeError(
-                f"Le fichier dépasse la limite de "
-                f"{MAX_FILE_MB} Mo."
-            )
-
+            raise RuntimeError(f"Le fichier dépasse la limite de {MAX_FILE_MB} Mo.")
         return {
             "path": path,
-            "title": (
-                info.get("title")
-                or query
-            )[:200],
-            "artist": (
-                info.get("artist")
-                or info.get("creator")
-                or info.get("uploader")
-                or "Artiste inconnu"
-            )[:100],
+            "title": (info.get("title") or query)[:200],
+            "artist": (info.get("artist") or info.get("creator") or info.get("uploader") or "Artiste inconnu")[:100],
             "album": info.get("album"),
-            "duration": int(info["duration"])
-            if info.get("duration")
-            else None,
+            "duration": int(info["duration"]) if info.get("duration") else None,
             "size": size,
             "folder": folder,
         }
+    except DownloadError as exc:
+        shutil.rmtree(folder, ignore_errors=True)
+        raise RuntimeError("Le service vidéo n'a pas pu récupérer ce titre pour le moment.") from exc
+    except Exception:
+        shutil.rmtree(folder, ignore_errors=True)
+        raise
 
 
 def download_video(url):
-    with TemporaryDirectory(prefix="video_") as folder:
-        try:
-            info = inspect_duration(
-                ydl_video_opts(folder),
-                url,
-            )
-
-            with YoutubeDL(ydl_video_opts(folder)) as ydl:
-                info = ydl.extract_info(
-                    url,
-                    download=True,
-                )
-
-        except DownloadError as exc:
-            raise RuntimeError(
-                "Je n'ai pas pu récupérer ce média. "
-                "Vérifie le lien puis réessaie."
-            ) from exc
-
-        path = find_media(
-            folder,
-            VIDEO_EXTS,
-        )
-
+    folder = mkdtemp(prefix="video_")
+    try:
+        info = inspect_duration(ydl_video_opts(folder), url)
+        with YoutubeDL(ydl_video_opts(folder)) as ydl:
+            info = ydl.extract_info(url, download=True)
+        path = find_media(folder, VIDEO_EXTS)
         if not path:
-            raise RuntimeError(
-                "Aucun fichier vidéo exploitable n'a été trouvé."
-            )
-
+            raise RuntimeError("Aucun fichier vidéo exploitable n'a été trouvé.")
         size = os.path.getsize(path)
-
         if size > MAX_FILE_BYTES:
-            raise RuntimeError(
-                f"La vidéo dépasse la limite de "
-                f"{MAX_FILE_MB} Mo."
-            )
-
+            raise RuntimeError(f"La vidéo dépasse la limite de {MAX_FILE_MB} Mo.")
         return {
             "path": path,
-            "title": (
-                info.get("title")
-                or "Vidéo"
-            )[:200],
-            "duration": int(info["duration"])
-            if info.get("duration")
-            else None,
+            "title": (info.get("title") or "Vidéo")[:200],
+            "duration": int(info["duration"]) if info.get("duration") else None,
             "size": size,
             "folder": folder,
         }
+    except DownloadError as exc:
+        shutil.rmtree(folder, ignore_errors=True)
+        raise RuntimeError("Je n'ai pas pu récupérer ce média. Vérifie le lien puis réessaie.") from exc
+    except Exception:
+        shutil.rmtree(folder, ignore_errors=True)
+        raise
 
 
 # ============================================================
@@ -809,46 +749,26 @@ def ask_for_artist(chat_id, title):
 
 
 def process_track(chat_id):
+    data = None
     try:
         st = get_state(chat_id)
-
         title = st.get("title", "").strip()
         artist = st.get("artist", "").strip()
-
         if not title or not artist:
-            send(
-                chat_id,
-                "⚠️ Les informations de cette recherche "
-                "ne sont plus disponibles.",
-            )
+            send(chat_id, "⚠️ Les informations de cette recherche ne sont plus disponibles.")
             return
 
-        status = send(
-            chat_id,
-            f"⏳ <i>Je prépare "
-            f"<b>{esc(title)}</b> de "
-            f"<b>{esc(artist)}</b>…</i>",
-        )
+        status = send(chat_id, f"⏳ <i>Je prépare <b>{esc(title)}</b> de <b>{esc(artist)}</b>…</i>")
+        data = download_audio(f"{artist} {title}".strip())
 
-        data = download_audio(
-            f"{artist} {title}".strip()
-        )
-
-        caption = (
-            f"🎵 <b>{esc(title)}</b>\n"
-            f"👤 {esc(artist)}"
-        )
-
+        caption = f"🎵 <b>{esc(title)}</b>\n👤 {esc(artist)}"
         if data.get("album"):
-            caption += (
-                f"\n💿 {esc(data['album'])}"
-            )
+            caption += f"\n💿 {esc(data['album'])}"
 
         with open(data["path"], "rb") as audio:
-            audio_file = io.BufferedReader(audio)
             bot.send_audio(
                 chat_id,
-                audio_file,
+                audio,
                 title=title[:200],
                 performer=artist[:100],
                 duration=data.get("duration"),
@@ -856,120 +776,56 @@ def process_track(chat_id):
                 parse_mode="HTML",
             )
 
-        edit(
-            chat_id,
-            status.message_id,
-            "✅ Voilà pour toi !",
-        )
+        edit(chat_id, status.message_id, "✅ Voilà pour toi !")
 
     except Exception as exc:
         log.exception("Track failed")
-        send(
-            chat_id,
-            "⚠️ Je n'ai pas pu récupérer ce titre "
-            "pour le moment.\n"
-            f"<i>{esc(str(exc))}</i>",
-        )
+        send(chat_id, "⚠️ Je n'ai pas pu récupérer ce titre pour le moment.\n<i>%s</i>" % esc(str(exc)))
     finally:
+        if data:
+            shutil.rmtree(data.get("folder", ""), ignore_errors=True)
         release_chat(chat_id)
 
 
 def process_album(chat_id, album_id):
     try:
-        status = send(
-            chat_id,
-            "💿 <i>Je récupère la liste des pistes…</i>",
-        )
-
+        status = send(chat_id, "💿 <i>Je récupère la liste des pistes…</i>")
         try:
-            album, tracks = album_tracks(
-                album_id
-            )
+            album, tracks = album_tracks(album_id)
         except Exception:
             log.exception("Album lookup failed")
-            edit(
-                chat_id,
-                status.message_id,
-                "⚠️ Impossible de récupérer cet album "
-                "pour le moment.",
-            )
+            edit(chat_id, status.message_id, "⚠️ Impossible de récupérer cet album pour le moment.")
             return
 
         if not tracks:
-            edit(
-                chat_id,
-                status.message_id,
-                "⚠️ Cet album ne contient aucune piste exploitable.",
-            )
+            edit(chat_id, status.message_id, "⚠️ Cet album ne contient aucune piste exploitable.")
             return
 
         tracks = tracks[:MAX_ALBUM_TRACKS]
         total = len(tracks)
         ok = 0
 
-        for index, track in enumerate(
-            tracks,
-            1,
-        ):
-            title = (
-                track.get("trackName")
-                or f"Piste {index}"
-            )
-
-            artist = (
-                track.get("artistName")
-                or album.get("artistName")
-                or "Artiste inconnu"
-            )
-
-            edit(
-                chat_id,
-                status.message_id,
-                f"💿 <b>{esc(album.get('collectionName') or 'Album')}</b>\n"
-                f"⏬ Piste <b>{index}/{total}</b> : "
-                f"{esc(title)}",
-            )
-
+        for index, track in enumerate(tracks, 1):
+            data = None
+            title = track.get("trackName") or f"Piste {index}"
+            artist = track.get("artistName") or album.get("artistName") or "Artiste inconnu"
+            edit(chat_id, status.message_id,
+                 f"💿 <b>{esc(album.get('collectionName') or 'Album')}</b>\n"
+                 f"⏬ Piste <b>{index}/{total}</b> : {esc(title)}")
             try:
-                data = download_audio(
-                    f"{artist} {title}"
-                )
-
-                caption = (
-                    f"💿 <b>Piste #{index}</b> — "
-                    f"{esc(title)}\n"
-                    f"👤 {esc(artist)}"
-                )
-
-                with open(
-                    data["path"],
-                    "rb",
-                ) as audio:
-                    bot.send_audio(
-                        chat_id,
-                        audio,
-                        title=title[:200],
-                        performer=artist[:100],
-                        duration=data.get("duration"),
-                        caption=caption[:1000],
-                        parse_mode="HTML",
-                    )
-
+                data = download_audio(f"{artist} {title}")
+                caption = f"💿 <b>Piste #{index}</b> — {esc(title)}\n👤 {esc(artist)}"
+                with open(data["path"], "rb") as audio:
+                    bot.send_audio(chat_id, audio, title=title[:200], performer=artist[:100],
+                                   duration=data.get("duration"), caption=caption[:1000], parse_mode="HTML")
                 ok += 1
-
             except Exception:
-                log.exception(
-                    "Album track failed: %s",
-                    title,
-                )
+                log.exception("Album track failed: %s", title)
+            finally:
+                if data:
+                    shutil.rmtree(data.get("folder", ""), ignore_errors=True)
 
-        edit(
-            chat_id,
-            status.message_id,
-            f"✅ Album terminé : "
-            f"<b>{ok}/{total}</b> piste(s) envoyée(s).",
-        )
-
+        edit(chat_id, status.message_id, f"✅ Album terminé : <b>{ok}/{total}</b> piste(s) envoyée(s).")
     finally:
         release_chat(chat_id)
 
@@ -979,43 +835,26 @@ def process_album(chat_id, album_id):
 # ============================================================
 
 def process_video(chat_id, url):
+    data = None
     try:
-        status = send(
-            chat_id,
-            "🎬 <i>Je traite ton lien…</i>",
-        )
-
+        status = send(chat_id, "🎬 <i>Je traite ton lien…</i>")
         data = download_video(url)
-
-        with open(
-            data["path"],
-            "rb",
-        ) as video:
+        with open(data["path"], "rb") as video:
             bot.send_video(
                 chat_id,
                 video,
-                caption=(
-                    f"🎬 <b>{esc(data['title'])}</b>"
-                )[:1000],
+                caption=f"🎬 <b>{esc(data['title'])}</b>"[:1000],
                 duration=data.get("duration"),
                 supports_streaming=True,
                 parse_mode="HTML",
             )
-
-        edit(
-            chat_id,
-            status.message_id,
-            "✅ Voilà ta vidéo.",
-        )
-
+        edit(chat_id, status.message_id, "✅ Voilà ta vidéo.")
     except Exception as exc:
         log.exception("Video failed")
-        send(
-            chat_id,
-            "⚠️ Je n'ai pas pu traiter ce lien.\n"
-            f"<i>{esc(str(exc))}</i>",
-        )
+        send(chat_id, "⚠️ Je n'ai pas pu traiter ce lien.\n<i>%s</i>" % esc(str(exc)))
     finally:
+        if data:
+            shutil.rmtree(data.get("folder", ""), ignore_errors=True)
         release_chat(chat_id)
 
 
