@@ -1,244 +1,514 @@
 # -*- coding: utf-8 -*-
 """
-MusicBot V2 - Telegram + Render + PostgreSQL
+MusicBot V2 — Telegram + Render + PostgreSQL
 
-IMPORTANT:
-- Put BOT_TOKEN only in Render Environment Variables.
-- This bot uses yt-dlp for URLs/searches. Users are responsible for
-  respecting copyright, platform terms and applicable law.
+Configuration par variables d'environnement :
+BOT_TOKEN          obligatoire
+DATABASE_URL       obligatoire
+PORT               fourni par Render (10000 par défaut)
+MAX_FILE_MB        49 par défaut
+MAX_DURATION       900 secondes par défaut
+MAX_ALBUM_TRACKS   10 par défaut
+COOLDOWN_SECONDS   5 par défaut
+WORKERS            3 par défaut
+ITUNES_COUNTRY     FR par défaut
+
+Le conteneur Render installe FFmpeg + Node.js afin que yt-dlp puisse
+convertir l'audio en M4A et fusionner les formats vidéo si nécessaire.
 """
+
 import html
+import io
 import logging
 import os
 import re
-import tempfile
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from tempfile import TemporaryDirectory
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 import psycopg
+from psycopg_pool import ConnectionPool
 from flask import Flask
 from PIL import Image
-import io
 import telebot
 from telebot import types
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
 
-# -------------------- Configuration --------------------
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
 TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 if not TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing. Add it in Render Environment Variables.")
+    raise RuntimeError("BOT_TOKEN est manquant. Ajoute BOT_TOKEN dans Render.")
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+if not DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL est manquant. Connecte une base PostgreSQL Render "
+        "et ajoute son Internal Database URL."
+    )
 
 PORT = int(os.environ.get("PORT", "10000"))
-DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
-MAX_FILE_MB = int(os.environ.get("MAX_FILE_MB", "49"))
+MAX_FILE_MB = max(1, int(os.environ.get("MAX_FILE_MB", "49")))
 MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
-MAX_DURATION = int(os.environ.get("MAX_DURATION", "900"))
-MAX_ALBUM_TRACKS = int(os.environ.get("MAX_ALBUM_TRACKS", "10"))
-COOLDOWN = float(os.environ.get("COOLDOWN_SECONDS", "5"))
-WORKERS = int(os.environ.get("WORKERS", "4"))
-ITUNES_COUNTRY = os.environ.get("ITUNES_COUNTRY", "FR")
+MAX_DURATION = max(30, int(os.environ.get("MAX_DURATION", "900")))
+MAX_ALBUM_TRACKS = max(1, int(os.environ.get("MAX_ALBUM_TRACKS", "10")))
+COOLDOWN = max(0.0, float(os.environ.get("COOLDOWN_SECONDS", "5")))
+WORKERS = max(1, int(os.environ.get("WORKERS", "3")))
+ITUNES_COUNTRY = os.environ.get("ITUNES_COUNTRY", "FR").upper()
 
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is missing. Connect a Render PostgreSQL database.")
-
-log = logging.getLogger("musicbot")
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+log = logging.getLogger("musicbot")
 
-bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=8)
-executor = ThreadPoolExecutor(max_workers=WORKERS)
 app = Flask(__name__)
 
-# Per-chat conversation state. It is intentionally ephemeral.
+bot = telebot.TeleBot(
+    TOKEN,
+    threaded=True,
+    num_threads=8,
+)
+
+executor = ThreadPoolExecutor(
+    max_workers=WORKERS,
+    thread_name_prefix="download",
+)
+
+
+# ============================================================
+# ETAT EN MEMOIRE
+# ============================================================
+
 state_lock = threading.Lock()
 states = {}
+
 cooldown_lock = threading.Lock()
 last_request = {}
 
-# -------------------- Database --------------------
-def db():
-    return psycopg.connect(DATABASE_URL, connect_timeout=10)
+busy_lock = threading.Lock()
+busy_chats = set()
 
-def init_db():
-    with db() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                chat_id BIGINT PRIMARY KEY,
-                first_name TEXT,
-                username TEXT,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS searches (
-                id BIGSERIAL PRIMARY KEY,
-                chat_id BIGINT NOT NULL,
-                query TEXT NOT NULL,
-                artist TEXT,
-                title TEXT,
-                album TEXT,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
-        """)
-        conn.commit()
-
-def save_user(message):
-    u = message.from_user
-    with db() as conn:
-        conn.execute("""
-            INSERT INTO users(chat_id, first_name, username)
-            VALUES (%s, %s, %s)
-            ON CONFLICT(chat_id) DO UPDATE SET
-                first_name = EXCLUDED.first_name,
-                username = EXCLUDED.username,
-                updated_at = NOW()
-        """, (message.chat.id, u.first_name if u else None, u.username if u else None))
-        conn.commit()
-
-def save_search(chat_id, query, artist=None, title=None, album=None):
-    try:
-        with db() as conn:
-            conn.execute(
-                "INSERT INTO searches(chat_id, query, artist, title, album) VALUES (%s,%s,%s,%s,%s)",
-                (chat_id, query, artist, title, album),
-            )
-            conn.commit()
-    except Exception:
-        log.exception("Could not save search")
-
-# -------------------- Web health --------------------
-@app.get("/")
-def home():
-    return "MusicBot V2 is running", 200
-
-@app.get("/health")
-def health():
-    return "ok", 200
-
-def start_web():
-    # Render web services must listen on 0.0.0.0 and the supplied PORT.
-    app.run(host="0.0.0.0", port=PORT, threaded=True)
-
-# -------------------- UI helpers --------------------
-def esc(value):
-    return html.escape(str(value or ""), quote=False)
-
-def send(chat_id, text, **kwargs):
-    kwargs.setdefault("parse_mode", "HTML")
-    return bot.send_message(chat_id, text, **kwargs)
-
-def edit(chat_id, message_id, text, **kwargs):
-    kwargs.setdefault("parse_mode", "HTML")
-    try:
-        return bot.edit_message_text(text, chat_id, message_id, **kwargs)
-    except Exception:
-        return None
-
-def answer(call, text="", alert=False):
-    try:
-        bot.answer_callback_query(call.id, text, show_alert=alert)
-    except Exception:
-        pass
-
-def music_keyboard():
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        types.InlineKeyboardButton("🎵 MUSIC", callback_data="mode_music"),
-        types.InlineKeyboardButton("🎬 VIDEO", callback_data="mode_video"),
-    )
-    return kb
-
-def cancel_keyboard():
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("❌ Annuler", callback_data="cancel"))
-    return kb
-
-def result_keyboard(album_id=None):
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(types.InlineKeyboardButton("⬇️ Télécharger", callback_data="download_track"))
-    if album_id:
-        kb.add(types.InlineKeyboardButton("💿 Télécharger l'album", callback_data=f"album:{album_id}"))
-    kb.add(types.InlineKeyboardButton("🔎 Nouvelle recherche", callback_data="mode_music"))
-    return kb
-
-def cooldown_ok(chat_id):
-    now = __import__("time").monotonic()
-    with cooldown_lock:
-        previous = last_request.get(chat_id, 0)
-        if now - previous < COOLDOWN:
-            return False, max(1, int(COOLDOWN - (now - previous)) + 1)
-        last_request[chat_id] = now
-    return True, 0
 
 def set_state(chat_id, **values):
     with state_lock:
-        current = states.get(chat_id, {})
+        current = states.get(chat_id, {}).copy()
         current.update(values)
         states[chat_id] = current
 
+
 def get_state(chat_id):
     with state_lock:
-        return dict(states.get(chat_id, {}))
+        return states.get(chat_id, {}).copy()
+
 
 def clear_state(chat_id):
     with state_lock:
         states.pop(chat_id, None)
 
-# -------------------- iTunes metadata --------------------
+
+def acquire_chat(chat_id):
+    with busy_lock:
+        if chat_id in busy_chats:
+            return False
+        busy_chats.add(chat_id)
+        return True
+
+
+def release_chat(chat_id):
+    with busy_lock:
+        busy_chats.discard(chat_id)
+
+
+def cooldown_ok(chat_id):
+    now = time.monotonic()
+    with cooldown_lock:
+        previous = last_request.get(chat_id, 0.0)
+        elapsed = now - previous
+        if elapsed < COOLDOWN:
+            return False, max(1, int(COOLDOWN - elapsed) + 1)
+        last_request[chat_id] = now
+        return True, 0
+
+
+# ============================================================
+# POSTGRESQL
+# ============================================================
+
+pool = ConnectionPool(
+    conninfo=DATABASE_URL,
+    min_size=1,
+    max_size=max(2, WORKERS + 2),
+    timeout=10,
+    open=False,
+)
+
+
+@contextmanager
+def db():
+    with pool.connection() as conn:
+        yield conn
+
+
+def init_db(retries=5):
+    last_error = None
+
+    for attempt in range(1, retries + 1):
+        try:
+            pool.open(waiting=True)
+
+            with db() as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS users (
+                        chat_id BIGINT PRIMARY KEY,
+                        first_name TEXT,
+                        username TEXT,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS searches (
+                        id BIGSERIAL PRIMARY KEY,
+                        chat_id BIGINT NOT NULL,
+                        query TEXT NOT NULL,
+                        artist TEXT,
+                        title TEXT,
+                        album TEXT,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+
+            log.info("PostgreSQL connectée et tables vérifiées.")
+            return
+
+        except Exception as exc:
+            last_error = exc
+            log.exception(
+                "Connexion PostgreSQL échouée (tentative %s/%s).",
+                attempt,
+                retries,
+            )
+            time.sleep(min(5 * attempt, 20))
+
+    raise RuntimeError(
+        f"Impossible de se connecter à PostgreSQL après {retries} tentatives: {last_error}"
+    )
+
+
+def save_user(message):
+    try:
+        user = message.from_user
+        with db() as conn:
+            conn.execute(
+                """
+                INSERT INTO users(chat_id, first_name, username)
+                VALUES (%s, %s, %s)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    first_name = EXCLUDED.first_name,
+                    username = EXCLUDED.username,
+                    updated_at = NOW()
+                """,
+                (
+                    message.chat.id,
+                    user.first_name if user else None,
+                    user.username if user else None,
+                ),
+            )
+    except Exception:
+        # Une panne DB ne doit pas faire tomber le bot.
+        log.exception("Impossible d'enregistrer l'utilisateur.")
+
+
+def save_search(chat_id, query, artist=None, title=None, album=None):
+    try:
+        with db() as conn:
+            conn.execute(
+                """
+                INSERT INTO searches(chat_id, query, artist, title, album)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (chat_id, query, artist, title, album),
+            )
+    except Exception:
+        log.exception("Impossible d'enregistrer la recherche.")
+
+
+# ============================================================
+# FLASK / RENDER
+# ============================================================
+
+@app.get("/")
+def home():
+    return "MusicBot V2 is running", 200
+
+
+@app.get("/health")
+def health():
+    return "ok", 200
+
+
+def start_web():
+    app.run(
+        host="0.0.0.0",
+        port=PORT,
+        threaded=True,
+        use_reloader=False,
+    )
+
+
+# ============================================================
+# TELEGRAM HELPERS
+# ============================================================
+
+def esc(value):
+    return html.escape(str(value or ""), quote=False)
+
+
+def send(chat_id, text, **kwargs):
+    kwargs.setdefault("parse_mode", "HTML")
+    return bot.send_message(chat_id, text, **kwargs)
+
+
+def edit(chat_id, message_id, text, **kwargs):
+    kwargs.setdefault("parse_mode", "HTML")
+    try:
+        return bot.edit_message_text(
+            text,
+            chat_id,
+            message_id,
+            **kwargs,
+        )
+    except Exception:
+        return None
+
+
+def answer(call, text="", alert=False):
+    try:
+        bot.answer_callback_query(
+            call.id,
+            text,
+            show_alert=alert,
+        )
+    except Exception:
+        pass
+
+
+def music_keyboard():
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton(
+            "🎵 MUSIC",
+            callback_data="mode_music",
+        ),
+        types.InlineKeyboardButton(
+            "🎬 VIDEO",
+            callback_data="mode_video",
+        ),
+    )
+    return kb
+
+
+def cancel_keyboard():
+    kb = types.InlineKeyboardMarkup()
+    kb.add(
+        types.InlineKeyboardButton(
+            "❌ Annuler",
+            callback_data="cancel",
+        )
+    )
+    return kb
+
+
+def result_keyboard(album_id=None):
+    kb = types.InlineKeyboardMarkup(row_width=2)
+
+    kb.add(
+        types.InlineKeyboardButton(
+            "⬇️ Télécharger",
+            callback_data="download_track",
+        )
+    )
+
+    if album_id:
+        kb.add(
+            types.InlineKeyboardButton(
+                "💿 Télécharger l'album",
+                callback_data=f"album:{album_id}",
+            )
+        )
+
+    kb.add(
+        types.InlineKeyboardButton(
+            "🔎 Nouvelle recherche",
+            callback_data="mode_music",
+        )
+    )
+
+    return kb
+
+
+# ============================================================
+# ITUNES
+# ============================================================
+
 def itunes(endpoint, params):
-    url = "https://itunes.apple.com/" + endpoint + "?" + urlencode(params)
-    req = Request(url, headers={"User-Agent": "MusicBotV2/1.0"})
-    with urlopen(req, timeout=12) as r:
+    url = (
+        "https://itunes.apple.com/"
+        + endpoint
+        + "?"
+        + urlencode(params)
+    )
+
+    req = Request(
+        url,
+        headers={"User-Agent": "MusicBotV2/2.0"},
+    )
+
+    with urlopen(req, timeout=12) as response:
         import json
-        return json.loads(r.read().decode("utf-8"))
+        return json.loads(
+            response.read().decode("utf-8")
+        )
+
 
 def search_itunes(query, artist=None):
-    term = f"{artist} {query}" if artist else query
-    data = itunes("search", {
-        "term": term,
-        "media": "music",
-        "entity": "song",
-        "limit": 20,
-        "country": ITUNES_COUNTRY,
-    })
-    results = data.get("results", [])
+    term = f"{artist} {query}".strip() if artist else query
+
+    data = itunes(
+        "search",
+        {
+            "term": term,
+            "media": "music",
+            "entity": "song",
+            "limit": 20,
+            "country": ITUNES_COUNTRY,
+        },
+    )
+
+    results = data.get("results") or []
+
     if artist:
         target = artist.lower()
-        results.sort(key=lambda x: 0 if target in (x.get("artistName") or "").lower() else 1)
+        results.sort(
+            key=lambda item: (
+                0
+                if target in (item.get("artistName") or "").lower()
+                else 1
+            )
+        )
+
     return results
 
+
 def album_tracks(album_id):
-    data = itunes("lookup", {
-        "id": album_id,
-        "entity": "song",
-        "country": ITUNES_COUNTRY,
-    })
-    results = data.get("results", [])
-    album = next((x for x in results if x.get("wrapperType") == "collection"), {})
-    tracks = [x for x in results if x.get("wrapperType") == "track" and x.get("kind") == "song"]
-    tracks.sort(key=lambda x: (x.get("discNumber", 1), x.get("trackNumber", 0)))
+    data = itunes(
+        "lookup",
+        {
+            "id": album_id,
+            "entity": "song",
+            "country": ITUNES_COUNTRY,
+        },
+    )
+
+    results = data.get("results") or []
+
+    album = next(
+        (
+            item
+            for item in results
+            if item.get("wrapperType") == "collection"
+        ),
+        {},
+    )
+
+    tracks = [
+        item
+        for item in results
+        if item.get("wrapperType") == "track"
+        and item.get("kind") == "song"
+    ]
+
+    tracks.sort(
+        key=lambda item: (
+            item.get("discNumber", 1),
+            item.get("trackNumber", 0),
+        )
+    )
+
     return album, tracks
 
-# -------------------- Download helpers --------------------
-AUDIO_EXTS = {".m4a", ".mp3", ".opus", ".ogg", ".webm", ".aac", ".flac", ".wav", ".mp4"}
-VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
 
-def ydl_opts(folder, video=False):
-    if video:
-        fmt = "best[ext=mp4][height<=1080]/best[ext=mp4]/best"
-    else:
-        fmt = "bestaudio[ext=m4a]/bestaudio/best"
+# ============================================================
+# YT-DLP
+# ============================================================
 
+AUDIO_EXTS = {
+    ".m4a",
+    ".mp3",
+    ".aac",
+    ".ogg",
+    ".opus",
+    ".flac",
+    ".wav",
+}
+
+VIDEO_EXTS = {
+    ".mp4",
+    ".mkv",
+    ".webm",
+    ".mov",
+    ".m4v",
+}
+
+
+def ydl_audio_opts(folder):
     return {
-        "format": fmt,
+        "format": "bestaudio/best",
         "outtmpl": os.path.join(folder, "%(id)s.%(ext)s"),
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 20,
+        "retries": 3,
+        "fragment_retries": 3,
+        "max_filesize": MAX_FILE_BYTES,
+        "overwrites": False,
+        "postprocessors": [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "m4a",
+                "preferredquality": "5",
+            }
+        ],
+    }
+
+
+def ydl_video_opts(folder):
+    return {
+        "format": (
+            "bv*[ext=mp4]+ba[ext=m4a]/"
+            "b[ext=mp4]/"
+            "best"
+        ),
+        "outtmpl": os.path.join(
+            folder,
+            "%(id)s.%(ext)s",
+        ),
+        "merge_output_format": "mp4",
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
@@ -249,108 +519,243 @@ def ydl_opts(folder, video=False):
         "overwrites": False,
     }
 
-def find_media(folder, video=False):
-    allowed = VIDEO_EXTS if video else AUDIO_EXTS
-    files = [
-        os.path.join(folder, f) for f in os.listdir(folder)
-        if os.path.splitext(f)[1].lower() in allowed
-    ]
-    return max(files, key=os.path.getsize) if files else None
 
-def prepare_cover(url, path):
-    if not url:
+def find_media(folder, allowed):
+    candidates = []
+
+    for filename in os.listdir(folder):
+        path = os.path.join(folder, filename)
+
+        if (
+            os.path.isfile(path)
+            and os.path.splitext(filename)[1].lower()
+            in allowed
+        ):
+            candidates.append(path)
+
+    if not candidates:
         return None
-    try:
-        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urlopen(req, timeout=10) as r:
-            raw = r.read(5 * 1024 * 1024)
-        img = Image.open(io.BytesIO(raw)).convert("RGB")
-        w, h = img.size
-        side = min(w, h)
-        img = img.crop(((w-side)//2, (h-side)//2, (w+side)//2, (h+side)//2))
-        img = img.resize((320, 320))
-        img.save(path, "JPEG", quality=82, optimize=True)
-        return path
-    except Exception:
-        log.exception("Cover preparation failed")
-        return None
+
+    return max(
+        candidates,
+        key=os.path.getsize,
+    )
+
+
+def inspect_duration(ydl_options, target):
+    with YoutubeDL(ydl_options) as ydl:
+        info = ydl.extract_info(
+            target,
+            download=False,
+        )
+
+    if not info:
+        raise RuntimeError(
+            "Aucun résultat exploitable n'a été trouvé."
+        )
+
+    entries = info.get("entries")
+    if entries:
+        info = next(
+            (entry for entry in entries if entry),
+            None,
+        )
+
+    if not info:
+        raise RuntimeError(
+            "Aucun résultat exploitable n'a été trouvé."
+        )
+
+    duration = info.get("duration")
+
+    if duration and duration > MAX_DURATION:
+        raise RuntimeError(
+            f"Ce média dure {int(duration // 60)} min "
+            f"{int(duration % 60):02d} s. "
+            f"La limite est de {MAX_DURATION // 60} min."
+        )
+
+    return info
+
 
 def download_audio(query):
-    with tempfile.TemporaryDirectory(prefix="music_") as folder:
+    with TemporaryDirectory(prefix="music_") as folder:
         target = f"ytsearch1:{query}"
+
         try:
-            with YoutubeDL(ydl_opts(folder, video=False)) as ydl:
-                info = ydl.extract_info(target, download=True)
+            preview = inspect_duration(
+                ydl_audio_opts(folder),
+                target,
+            )
+
+            with YoutubeDL(ydl_audio_opts(folder)) as ydl:
+                info = ydl.extract_info(
+                    target,
+                    download=True,
+                )
+
         except DownloadError as exc:
-            raise RuntimeError("Le service vidéo n'a pas pu récupérer ce titre pour le moment.") from exc
+            raise RuntimeError(
+                "Le service vidéo n'a pas pu récupérer ce titre "
+                "pour le moment."
+            ) from exc
 
-        if info and "entries" in info:
-            entries = [x for x in info.get("entries") or [] if x]
-            info = entries[0] if entries else None
-        path = find_media(folder, video=False)
-        if not info or not path:
-            raise RuntimeError("Aucun résultat exploitable n'a été trouvé.")
-        if os.path.getsize(path) > MAX_FILE_BYTES:
-            raise RuntimeError(f"Le fichier dépasse la limite configurée de {MAX_FILE_MB} Mo.")
+        if info and info.get("entries"):
+            info = next(
+                (entry for entry in info["entries"] if entry),
+                preview,
+            )
 
-        # Telegram upload happens before TemporaryDirectory is destroyed.
+        path = find_media(
+            folder,
+            AUDIO_EXTS,
+        )
+
+        if not path:
+            raise RuntimeError(
+                "Le fichier audio n'a pas été produit."
+            )
+
+        size = os.path.getsize(path)
+
+        if size > MAX_FILE_BYTES:
+            raise RuntimeError(
+                f"Le fichier dépasse la limite de "
+                f"{MAX_FILE_MB} Mo."
+            )
+
         return {
-            "bytes": open(path, "rb").read(),
-            "title": (info.get("title") or query)[:200],
-            "artist": (info.get("artist") or info.get("creator") or info.get("uploader") or "Artiste inconnu")[:100],
+            "path": path,
+            "title": (
+                info.get("title")
+                or query
+            )[:200],
+            "artist": (
+                info.get("artist")
+                or info.get("creator")
+                or info.get("uploader")
+                or "Artiste inconnu"
+            )[:100],
             "album": info.get("album"),
-            "duration": int(info["duration"]) if info.get("duration") else None,
-            "thumbnail": info.get("thumbnail"),
+            "duration": int(info["duration"])
+            if info.get("duration")
+            else None,
+            "size": size,
+            "folder": folder,
         }
+
 
 def download_video(url):
-    with tempfile.TemporaryDirectory(prefix="video_") as folder:
+    with TemporaryDirectory(prefix="video_") as folder:
         try:
-            with YoutubeDL(ydl_opts(folder, video=True)) as ydl:
-                info = ydl.extract_info(url, download=True)
+            info = inspect_duration(
+                ydl_video_opts(folder),
+                url,
+            )
+
+            with YoutubeDL(ydl_video_opts(folder)) as ydl:
+                info = ydl.extract_info(
+                    url,
+                    download=True,
+                )
+
         except DownloadError as exc:
-            raise RuntimeError("Je n'ai pas pu récupérer ce média. Vérifie le lien puis réessaie.") from exc
-        path = find_media(folder, video=True)
-        if not info or not path:
-            raise RuntimeError("Aucun fichier vidéo exploitable n'a été trouvé.")
-        if os.path.getsize(path) > MAX_FILE_BYTES:
-            raise RuntimeError(f"Le fichier dépasse la limite configurée de {MAX_FILE_MB} Mo.")
+            raise RuntimeError(
+                "Je n'ai pas pu récupérer ce média. "
+                "Vérifie le lien puis réessaie."
+            ) from exc
+
+        path = find_media(
+            folder,
+            VIDEO_EXTS,
+        )
+
+        if not path:
+            raise RuntimeError(
+                "Aucun fichier vidéo exploitable n'a été trouvé."
+            )
+
+        size = os.path.getsize(path)
+
+        if size > MAX_FILE_BYTES:
+            raise RuntimeError(
+                f"La vidéo dépasse la limite de "
+                f"{MAX_FILE_MB} Mo."
+            )
+
         return {
-            "bytes": open(path, "rb").read(),
-            "title": (info.get("title") or "Vidéo")[:200],
-            "duration": int(info["duration"]) if info.get("duration") else None,
+            "path": path,
+            "title": (
+                info.get("title")
+                or "Vidéo"
+            )[:200],
+            "duration": int(info["duration"])
+            if info.get("duration")
+            else None,
+            "size": size,
+            "folder": folder,
         }
 
-# -------------------- Music flow --------------------
+
+# ============================================================
+# MUSIQUE
+# ============================================================
+
 def search_and_show(chat_id):
     st = get_state(chat_id)
+
     title = st.get("title", "").strip()
     artist = st.get("artist", "").strip()
-    status = send(chat_id, f"🔎 <i>Je recherche <b>{esc(title)}</b>{' de ' + esc(artist) if artist else ''}…</i>")
+
+    status = send(
+        chat_id,
+        "🔎 <i>Je recherche "
+        f"<b>{esc(title)}</b>"
+        f"{' de ' + esc(artist) if artist else ''}…</i>",
+    )
+
     try:
-        results = search_itunes(title, artist)
+        results = search_itunes(
+            title,
+            artist,
+        )
     except Exception:
         log.exception("iTunes search failed")
-        edit(chat_id, status.message_id, "⚠️ Le service de recherche est momentanément indisponible. Réessaie dans quelques minutes.")
+        edit(
+            chat_id,
+            status.message_id,
+            "⚠️ Le service de recherche est momentanément "
+            "indisponible. Réessaie plus tard.",
+        )
         return
 
     if not results:
-        edit(chat_id, status.message_id, "⚠️ Je n'ai trouvé aucun résultat. Essaie avec le titre et l'artiste.")
+        edit(
+            chat_id,
+            status.message_id,
+            "⚠️ Aucun résultat trouvé. "
+            "Essaie avec le titre et l'artiste.",
+        )
         return
 
-    # Pick a metadata match. We keep alternatives available if several results exist.
     best = results[0]
     album_id = best.get("collectionId")
+
     set_state(
         chat_id,
         mode="music",
+        step="result",
         title=best.get("trackName") or title,
         artist=best.get("artistName") or artist,
         album=best.get("collectionName"),
-        album_id=str(album_id) if album_id else None,
-        release_date=(best.get("releaseDate") or "")[:4],
-        search_results=results[:8],
+        album_id=str(album_id)
+        if album_id
+        else None,
+        release_date=(
+            best.get("releaseDate") or ""
+        )[:4],
     )
+
     save_search(
         chat_id,
         title,
@@ -358,122 +763,277 @@ def search_and_show(chat_id):
         best.get("trackName"),
         best.get("collectionName"),
     )
-    year = (best.get("releaseDate") or "")[:4]
-    album = best.get("collectionName") or "Album inconnu"
+
+    year = (
+        best.get("releaseDate") or ""
+    )[:4]
+
+    album = (
+        best.get("collectionName")
+        or "Album inconnu"
+    )
+
     text = (
         f"🎵 <b>{esc(best.get('trackName') or title)}</b>\n"
         f"👤 <b>{esc(best.get('artistName') or artist or 'Artiste inconnu')}</b>\n"
         f"💿 <b>{esc(album)}</b>"
-        + (f"\n📅 {year}" if year else "")
-        + "\n\n🫴 Voilà ce que j'ai trouvé."
-    )
-    edit(chat_id, status.message_id, text, reply_markup=result_keyboard(album_id))
-
-def ask_for_artist(chat_id, title):
-    set_state(chat_id, mode="music", step="waiting_artist", title=title)
-    send(
-        chat_id,
-        f"🎵 <b>{esc(title)}</b> — excellent choix !\n\n"
-        "Pour être plus précis, <b>qui chante ce titre ?</b>\n"
-        "👤 Donne-moi simplement le nom de l'artiste.",
-        reply_markup=cancel_keyboard(),
     )
 
-def process_track(chat_id):
-    st = get_state(chat_id)
-    title = st.get("title", "")
-    artist = st.get("artist", "")
-    status = send(chat_id, f"⏳ <i>Je prépare <b>{esc(title)}</b> de {esc(artist)}…</i>")
-    try:
-        data = download_audio(f"{artist} {title}".strip())
-        audio = io.BytesIO(data["bytes"])
-        audio.name = "audio.m4a"
-        caption = f"🎵 <b>{esc(title)}</b>\n👤 {esc(artist)}"
-        if data.get("album"):
-            caption += f"\n💿 {esc(data['album'])}"
-        bot.send_audio(
-            chat_id,
-            audio,
-            title=title[:200],
-            performer=artist[:100],
-            duration=data.get("duration"),
-            caption=caption[:1000],
-            parse_mode="HTML",
-        )
-        edit(chat_id, status.message_id, "✅ Voilà pour toi !")
-    except Exception as exc:
-        log.exception("Track failed")
-        edit(chat_id, status.message_id, f"⚠️ Je n'ai pas pu récupérer ce titre pour le moment.\n<i>{esc(str(exc))}</i>")
+    if year:
+        text += f"\n📅 {year}"
 
-def process_album(chat_id, album_id):
-    status = send(chat_id, "💿 <i>Je récupère la liste des pistes…</i>")
-    try:
-        album, tracks = album_tracks(album_id)
-    except Exception:
-        log.exception("Album lookup failed")
-        edit(chat_id, status.message_id, "⚠️ Je n'arrive pas à récupérer cet album pour le moment. Réessaie dans quelques minutes.")
-        return
-
-    if not tracks:
-        edit(chat_id, status.message_id, "⚠️ Cet album ne contient aucune piste exploitable.")
-        return
-
-    tracks = tracks[:MAX_ALBUM_TRACKS]
-    total = len(tracks)
-    ok = 0
-    for index, track in enumerate(tracks, 1):
-        title = track.get("trackName") or f"Piste {index}"
-        artist = track.get("artistName") or album.get("artistName") or "Artiste inconnu"
-        edit(chat_id, status.message_id, f"💿 <b>{esc(album.get('collectionName') or 'Album')}</b>\n⏬ Piste <b>{index}/{total}</b> : {esc(title)}")
-        try:
-            data = download_audio(f"{artist} {title}")
-            audio = io.BytesIO(data["bytes"])
-            audio.name = "audio.m4a"
-            bot.send_audio(
-                chat_id,
-                audio,
-                title=title[:200],
-                performer=artist[:100],
-                duration=data.get("duration"),
-                caption=f"💿 <b>Piste #{index}</b> — {esc(title)}\n👤 {esc(artist)}"[:1000],
-                parse_mode="HTML",
-            )
-            ok += 1
-        except Exception:
-            log.exception("Album track failed: %s", title)
+    text += "\n\n🫴 Voilà ce que j'ai trouvé."
 
     edit(
         chat_id,
         status.message_id,
-        f"✅ Album terminé : <b>{ok}/{total}</b> piste(s) envoyée(s).",
+        text,
+        reply_markup=result_keyboard(album_id),
     )
 
-# -------------------- Video flow --------------------
-def process_video(chat_id, url):
-    status = send(chat_id, "🎬 <i>Je traite ton lien…</i>")
+
+def ask_for_artist(chat_id, title):
+    set_state(
+        chat_id,
+        mode="music",
+        step="waiting_artist",
+        title=title,
+    )
+
+    send(
+        chat_id,
+        f"🎵 <b>{esc(title)}</b>\n\n"
+        "👤 Quel est le nom de l'artiste ?",
+        reply_markup=cancel_keyboard(),
+    )
+
+
+def process_track(chat_id):
     try:
-        data = download_video(url)
-        video = io.BytesIO(data["bytes"])
-        video.name = "video.mp4"
-        bot.send_video(
+        st = get_state(chat_id)
+
+        title = st.get("title", "").strip()
+        artist = st.get("artist", "").strip()
+
+        if not title or not artist:
+            send(
+                chat_id,
+                "⚠️ Les informations de cette recherche "
+                "ne sont plus disponibles.",
+            )
+            return
+
+        status = send(
             chat_id,
-            video,
-            caption=f"🎬 <b>{esc(data['title'])}</b>"[:1000],
-            duration=data.get("duration"),
-            supports_streaming=True,
-            parse_mode="HTML",
+            f"⏳ <i>Je prépare "
+            f"<b>{esc(title)}</b> de "
+            f"<b>{esc(artist)}</b>…</i>",
         )
-        edit(chat_id, status.message_id, "✅ Voilà ta vidéo.")
+
+        data = download_audio(
+            f"{artist} {title}".strip()
+        )
+
+        caption = (
+            f"🎵 <b>{esc(title)}</b>\n"
+            f"👤 {esc(artist)}"
+        )
+
+        if data.get("album"):
+            caption += (
+                f"\n💿 {esc(data['album'])}"
+            )
+
+        with open(data["path"], "rb") as audio:
+            audio_file = io.BufferedReader(audio)
+            bot.send_audio(
+                chat_id,
+                audio_file,
+                title=title[:200],
+                performer=artist[:100],
+                duration=data.get("duration"),
+                caption=caption[:1000],
+                parse_mode="HTML",
+            )
+
+        edit(
+            chat_id,
+            status.message_id,
+            "✅ Voilà pour toi !",
+        )
+
+    except Exception as exc:
+        log.exception("Track failed")
+        send(
+            chat_id,
+            "⚠️ Je n'ai pas pu récupérer ce titre "
+            "pour le moment.\n"
+            f"<i>{esc(str(exc))}</i>",
+        )
+    finally:
+        release_chat(chat_id)
+
+
+def process_album(chat_id, album_id):
+    try:
+        status = send(
+            chat_id,
+            "💿 <i>Je récupère la liste des pistes…</i>",
+        )
+
+        try:
+            album, tracks = album_tracks(
+                album_id
+            )
+        except Exception:
+            log.exception("Album lookup failed")
+            edit(
+                chat_id,
+                status.message_id,
+                "⚠️ Impossible de récupérer cet album "
+                "pour le moment.",
+            )
+            return
+
+        if not tracks:
+            edit(
+                chat_id,
+                status.message_id,
+                "⚠️ Cet album ne contient aucune piste exploitable.",
+            )
+            return
+
+        tracks = tracks[:MAX_ALBUM_TRACKS]
+        total = len(tracks)
+        ok = 0
+
+        for index, track in enumerate(
+            tracks,
+            1,
+        ):
+            title = (
+                track.get("trackName")
+                or f"Piste {index}"
+            )
+
+            artist = (
+                track.get("artistName")
+                or album.get("artistName")
+                or "Artiste inconnu"
+            )
+
+            edit(
+                chat_id,
+                status.message_id,
+                f"💿 <b>{esc(album.get('collectionName') or 'Album')}</b>\n"
+                f"⏬ Piste <b>{index}/{total}</b> : "
+                f"{esc(title)}",
+            )
+
+            try:
+                data = download_audio(
+                    f"{artist} {title}"
+                )
+
+                caption = (
+                    f"💿 <b>Piste #{index}</b> — "
+                    f"{esc(title)}\n"
+                    f"👤 {esc(artist)}"
+                )
+
+                with open(
+                    data["path"],
+                    "rb",
+                ) as audio:
+                    bot.send_audio(
+                        chat_id,
+                        audio,
+                        title=title[:200],
+                        performer=artist[:100],
+                        duration=data.get("duration"),
+                        caption=caption[:1000],
+                        parse_mode="HTML",
+                    )
+
+                ok += 1
+
+            except Exception:
+                log.exception(
+                    "Album track failed: %s",
+                    title,
+                )
+
+        edit(
+            chat_id,
+            status.message_id,
+            f"✅ Album terminé : "
+            f"<b>{ok}/{total}</b> piste(s) envoyée(s).",
+        )
+
+    finally:
+        release_chat(chat_id)
+
+
+# ============================================================
+# VIDEO
+# ============================================================
+
+def process_video(chat_id, url):
+    try:
+        status = send(
+            chat_id,
+            "🎬 <i>Je traite ton lien…</i>",
+        )
+
+        data = download_video(url)
+
+        with open(
+            data["path"],
+            "rb",
+        ) as video:
+            bot.send_video(
+                chat_id,
+                video,
+                caption=(
+                    f"🎬 <b>{esc(data['title'])}</b>"
+                )[:1000],
+                duration=data.get("duration"),
+                supports_streaming=True,
+                parse_mode="HTML",
+            )
+
+        edit(
+            chat_id,
+            status.message_id,
+            "✅ Voilà ta vidéo.",
+        )
+
     except Exception as exc:
         log.exception("Video failed")
-        edit(chat_id, status.message_id, f"⚠️ Je n'ai pas pu traiter ce lien.\n<i>{esc(str(exc))}</i>")
+        send(
+            chat_id,
+            "⚠️ Je n'ai pas pu traiter ce lien.\n"
+            f"<i>{esc(str(exc))}</i>",
+        )
+    finally:
+        release_chat(chat_id)
 
-# -------------------- Commands --------------------
+
+# ============================================================
+# COMMANDES
+# ============================================================
+
 @bot.message_handler(commands=["start"])
 def start(message):
     save_user(message)
     clear_state(message.chat.id)
-    name = message.from_user.first_name if message.from_user else "ami"
+
+    name = (
+        message.from_user.first_name
+        if message.from_user
+        else "ami"
+    )
+
     send(
         message.chat.id,
         f"👋 <b>Bonjour {esc(name)} !</b>\n\n"
@@ -482,79 +1042,172 @@ def start(message):
         reply_markup=music_keyboard(),
     )
 
+
 @bot.message_handler(commands=["aide", "help"])
 def help_cmd(message):
     send(
         message.chat.id,
         "🎧 <b>Aide</b>\n\n"
-        "🎵 <b>Music</b> : recherche un titre avec son artiste.\n"
-        "🎬 <b>Video</b> : traite un lien média compatible.\n\n"
-        "Tu peux aussi utiliser /start pour revenir au menu."
+        "🎵 <b>Music</b> : recherche un titre et son artiste.\n"
+        "🎬 <b>Video</b> : traite un lien compatible.\n\n"
+        "Utilise /start pour revenir au menu.",
     )
 
-# -------------------- Callbacks --------------------
-@bot.callback_query_handler(func=lambda c: c.data == "mode_music")
+
+# ============================================================
+# CALLBACKS
+# ============================================================
+
+@bot.callback_query_handler(
+    func=lambda c: c.data == "mode_music"
+)
 def cb_music(call):
     answer(call)
-    set_state(call.message.chat.id, mode="music", step="waiting_title")
+
+    set_state(
+        call.message.chat.id,
+        mode="music",
+        step="waiting_title",
+    )
+
     send(
         call.message.chat.id,
         "🎵 <b>Mode Music</b>\n\n"
-        "Quel titre ou album souhaites-tu écouter aujourd'hui ?",
+        "Quel titre souhaites-tu rechercher ?",
         reply_markup=cancel_keyboard(),
     )
 
-@bot.callback_query_handler(func=lambda c: c.data == "mode_video")
+
+@bot.callback_query_handler(
+    func=lambda c: c.data == "mode_video"
+)
 def cb_video(call):
     answer(call)
-    set_state(call.message.chat.id, mode="video", step="waiting_url")
+
+    set_state(
+        call.message.chat.id,
+        mode="video",
+        step="waiting_url",
+    )
+
     send(
         call.message.chat.id,
         "🎬 <b>Mode Video</b>\n\n"
-        "Envoie-moi le lien du média que tu veux traiter.",
+        "Envoie-moi le lien du média.",
         reply_markup=cancel_keyboard(),
     )
 
-@bot.callback_query_handler(func=lambda c: c.data == "cancel")
+
+@bot.callback_query_handler(
+    func=lambda c: c.data == "cancel"
+)
 def cb_cancel(call):
     answer(call, "Annulé")
     clear_state(call.message.chat.id)
-    send(call.message.chat.id, "D'accord 👍", reply_markup=music_keyboard())
+    send(
+        call.message.chat.id,
+        "D'accord 👍",
+        reply_markup=music_keyboard(),
+    )
 
-@bot.callback_query_handler(func=lambda c: c.data == "download_track")
+
+@bot.callback_query_handler(
+    func=lambda c: c.data == "download_track"
+)
 def cb_download(call):
-    answer(call, "Préparation…")
     chat_id = call.message.chat.id
-    st = get_state(chat_id)
-    if not st.get("title") or not st.get("artist"):
-        send(chat_id, "⚠️ La recherche a expiré. Recommence avec /start.")
-        return
-    ok, wait = cooldown_ok(chat_id)
-    if not ok:
-        send(chat_id, f"⏳ Patiente encore {wait}s.")
-        return
-    executor.submit(process_track, chat_id)
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("album:"))
+    st = get_state(chat_id)
+
+    if (
+        not st.get("title")
+        or not st.get("artist")
+    ):
+        answer(
+            call,
+            "La recherche a expiré.",
+            alert=True,
+        )
+        return
+
+    ok, wait = cooldown_ok(chat_id)
+
+    if not ok:
+        answer(
+            call,
+            f"Patiente {wait}s.",
+            alert=True,
+        )
+        return
+
+    if not acquire_chat(chat_id):
+        answer(
+            call,
+            "Une tâche est déjà en cours.",
+            alert=True,
+        )
+        return
+
+    answer(call, "Préparation…")
+    executor.submit(
+        process_track,
+        chat_id,
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("album:")
+)
 def cb_album(call):
     chat_id = call.message.chat.id
     album_id = call.data.split(":", 1)[1]
-    if not album_id.isdigit():
-        answer(call, "Album invalide.", alert=True)
-        return
-    ok, wait = cooldown_ok(chat_id)
-    if not ok:
-        answer(call, f"Patiente {wait}s.", alert=True)
-        return
-    answer(call, "Album lancé…")
-    executor.submit(process_album, chat_id, album_id)
 
-# -------------------- Text messages --------------------
+    if not album_id.isdigit():
+        answer(
+            call,
+            "Album invalide.",
+            alert=True,
+        )
+        return
+
+    ok, wait = cooldown_ok(chat_id)
+
+    if not ok:
+        answer(
+            call,
+            f"Patiente {wait}s.",
+            alert=True,
+        )
+        return
+
+    if not acquire_chat(chat_id):
+        answer(
+            call,
+            "Une tâche est déjà en cours.",
+            alert=True,
+        )
+        return
+
+    answer(call, "Album lancé…")
+
+    executor.submit(
+        process_album,
+        chat_id,
+        album_id,
+    )
+
+
+# ============================================================
+# TEXTES
+# ============================================================
+
 @bot.message_handler(content_types=["text"])
 def text_message(message):
     save_user(message)
+
     chat_id = message.chat.id
     text = (message.text or "").strip()
+
     if not text or text.startswith("/"):
         return
 
@@ -562,49 +1215,146 @@ def text_message(message):
     mode = st.get("mode")
     step = st.get("step")
 
-    if mode == "video" and step == "waiting_url":
-        if not re.match(r"^https?://", text, re.I):
-            send(chat_id, "⚠️ Envoie-moi un lien commençant par http:// ou https://.")
+    if (
+        mode == "video"
+        and step == "waiting_url"
+    ):
+        if not re.match(
+            r"^https?://",
+            text,
+            re.I,
+        ):
+            send(
+                chat_id,
+                "⚠️ Envoie un lien commençant par "
+                "http:// ou https://.",
+            )
             return
+
+        if not acquire_chat(chat_id):
+            send(
+                chat_id,
+                "⏳ Une tâche est déjà en cours.",
+            )
+            return
+
         clear_state(chat_id)
-        executor.submit(process_video, chat_id, text[:2000])
+
+        executor.submit(
+            process_video,
+            chat_id,
+            text[:2000],
+        )
         return
 
-    if mode == "music" and step == "waiting_artist":
+    if (
+        mode == "music"
+        and step == "waiting_artist"
+    ):
         artist = text[:100]
-        set_state(chat_id, artist=artist, step="searching")
-        send(chat_id, f"👊 Je vois ! <b>{esc(st.get('title'))}</b> de <b>{esc(artist)}</b>.\n⏳ Je lance la recherche…")
-        executor.submit(search_and_show, chat_id)
+
+        set_state(
+            chat_id,
+            artist=artist,
+            step="searching",
+        )
+
+        send(
+            chat_id,
+            f"👊 <b>{esc(st.get('title'))}</b> "
+            f"de <b>{esc(artist)}</b>.\n"
+            "⏳ Je lance la recherche…",
+        )
+
+        executor.submit(
+            search_and_show,
+            chat_id,
+        )
         return
 
-    # Default: treat a normal text as a music title, but ask artist first.
-    ask_for_artist(chat_id, text[:200])
+    if (
+        mode == "music"
+        and step == "waiting_title"
+    ):
+        ask_for_artist(
+            chat_id,
+            text[:200],
+        )
+        return
 
-# -------------------- Main --------------------
+    # Hors conversation : texte = titre.
+    ask_for_artist(
+        chat_id,
+        text[:200],
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
 def main():
+    # Le serveur HTTP démarre immédiatement pour que Render
+    # puisse détecter le port pendant que PostgreSQL est vérifiée.
+    threading.Thread(
+        target=start_web,
+        daemon=True,
+        name="render-web",
+    ).start()
+
     init_db()
-    threading.Thread(target=start_web, daemon=True).start()
 
     try:
         bot.remove_webhook()
     except Exception:
-        pass
+        log.exception("remove_webhook a échoué")
 
     try:
-        bot.set_my_commands([
-            types.BotCommand("start", "Ouvrir le menu"),
-            types.BotCommand("aide", "Afficher l'aide"),
-        ])
+        bot.set_my_commands(
+            [
+                types.BotCommand(
+                    "start",
+                    "Ouvrir le menu",
+                ),
+                types.BotCommand(
+                    "aide",
+                    "Afficher l'aide",
+                ),
+            ]
+        )
     except Exception:
-        log.exception("Could not set commands")
+        log.exception(
+            "Impossible de configurer les commandes Telegram."
+        )
 
-    log.info("MusicBot V2 starting")
-    bot.infinity_polling(
-        timeout=30,
-        long_polling_timeout=20,
-        skip_pending=True,
-        allowed_updates=["message", "callback_query"],
+    log.info(
+        "MusicBot V2 démarré | workers=%s | max_file=%sMB | max_duration=%ss",
+        WORKERS,
+        MAX_FILE_MB,
+        MAX_DURATION,
     )
+
+    try:
+        bot.infinity_polling(
+            timeout=30,
+            long_polling_timeout=20,
+            skip_pending=True,
+            allowed_updates=[
+                "message",
+                "callback_query",
+            ],
+        )
+    finally:
+        executor.shutdown(
+            wait=False,
+            cancel_futures=True,
+        )
+
+        try:
+            pool.close()
+        except Exception:
+            pass
+
 
 if __name__ == "__main__":
     main()
