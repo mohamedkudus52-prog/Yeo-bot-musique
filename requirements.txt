@@ -1,4 +1,6 @@
 pyTelegramBotAPI
-Flask
-psycopg[binary,pool]
-yt-dlp[default]
+yt-dlp
+psycopg[binary]
+flask
+pillow
+
