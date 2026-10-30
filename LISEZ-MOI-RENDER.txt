@@ -1,0 +1,52 @@
+TÉO — VERSION RENDER (mise à jour 31)
+=====================================
+
+Ce dossier contient TOUT ce qu'il faut mettre sur GitHub pour Render. Rien d'autre.
+
+1) METTRE LES FICHIERS SUR GITHUB
+   - Ouvre ton dépôt, « Add file » > « Upload files », glisse TOUT le contenu de ce dossier
+     (les fichiers ET le dossier assets), puis « Commit changes ».
+   - Remplace bien : Dockerfile, requirements.txt, main.py, extras.py, sante.py, backup.py, miniapp.py, miniapp.html.
+   - Ne mets JAMAIS ton jeton dans GitHub : il se colle dans Render (étape 2).
+
+2) VARIABLES SUR RENDER (onglet « Environment »)
+   BOT_TOKEN        le jeton de CE bot (un jeton = un seul endroit : Render OU le téléphone, jamais les deux)
+   OWNER_IDS        6440453182   (tu es reconnu comme patron)
+   BACKUP_CHAT_ID   6440453182   (la sauvegarde arrive chez toi : sans elle, la base est perdue à chaque redémarrage)
+   Le reste est facultatif : YTDLP_PROXY (proxy résidentiel), AUDIO_FORMAT, MAX_DL, DL_BUDGET.
+   La Mini App et le bouton « Téo » sont automatiques sur Render (adresse fournie par Render).
+
+3) DÉPLOYER
+   Render redéploie tout seul après le commit. Au bout de 3 à 5 minutes : /start sur le bot,
+   puis /diag : la ligne Version doit afficher « mise à jour 31 ».
+
+4) CE QUI CHANGE PAR RAPPORT À L'ANCIENNE VERSION
+   - Grand clavier fixe + bouton ⬅️ Retour sur chaque écran + tableau du patron (Stats, Utilisateurs, Santé, Cookies, Qualité).
+   - 🎚 Qualité (Espace patron) : audio M4A d'origine ou MP3 128/192/320, vidéo MP4 720/480/360p.
+   - Mini App : Titres, Explorer (recherche, tendances), Albums, Favoris, Santé (patron).
+   - Cookies YouTube : envoie ton cookies.txt au bot comme un fichier, il l'active et le sauvegarde.
+   - /sante et alertes automatiques (échecs de téléchargement, cookies bientôt périmés).
+   - Délai maximum par titre (DL_BUDGET) : fini le blocage sur « Recherche de la version officielle ».
+
+5) À SAVOIR (franchise)
+   - YouTube bloque souvent les serveurs comme Render (« Sign in to confirm you're not a bot »).
+     Ce n'est pas un bug du bot : c'est l'adresse du serveur. Ce qui aide : cookies envoyés par Telegram,
+     ou un proxy résidentiel (YTDLP_PROXY). Sur ton téléphone (adresse de maison) ce blocage est bien plus rare.
+   - Offre gratuite : 512 Mo de mémoire et service qui s'endort sans visite (le bot se réveille tout seul toutes
+     les 10 minutes). Les titres déjà téléchargés restent dans Telegram.
+
+6) SI YOUTUBE BLOQUE ENCORE (« Sign in to confirm you're not a bot »)
+   Cause : Render est un serveur ; YouTube se méfie de ces adresses. Ce n'est pas un bug du code.
+   Du plus sûr au moins sûr :
+   a) Proxy résidentiel payant : variable YTDLP_PROXY = http://utilisateur:mdp@hote:port
+      (les proxys gratuits ou « datacenter » ne servent à rien).
+   b) Ton téléphone (Termux) : adresse de maison, c'est la voie qui marche chez toi.
+   c) Cookies : envoie un cookies.txt tout neuf au bot (fichier, depuis un compte Google SECONDAIRE,
+      jamais ton compte principal : un compte utilisé sur un serveur peut être restreint).
+   d) FORCE_IPV4=1 : déjà activé dans ce dossier.
+   e) PO token (avancé) : variable POT_URL = adresse d'un serveur bgutil que tu héberges toi-même
+      (projet Brainicism/bgutil-ytdlp-pot-provider). Peut aider, sans garantie ; non fourni ici car trop gourmand
+      en mémoire pour l'offre gratuite de Render (512 Mo).
+   Ne télécharge jamais d'outils « anti-blocage » trouvés sur des forums ou le dark web : ils volent souvent
+   tes cookies ou ton jeton. Seuls yt-dlp et les options ci-dessus (documentées publiquement) sont utilisés ici.
+   Vérifie ce qui est actif avec /diag (ligne « Anti-blocage »).

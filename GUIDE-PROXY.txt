@@ -1,0 +1,53 @@
+GUIDE PROXY RÉSIDENTIEL POUR RENDER
+===================================
+
+POURQUOI
+YouTube bloque l'adresse des serveurs (Render). Un proxy résidentiel fait passer le bot par l'adresse
+d'un particulier : YouTube le laisse passer. C'est la solution la plus fiable sur Render, mais elle est payante.
+Rien ne garantit le résultat à 100 % : YouTube durcit ses contrôles régulièrement.
+
+1) CHOISIR UN FOURNISSEUR
+   Cherche un fournisseur de « proxys résidentiels » (ou mobiles) avec :
+   - un tarif « au Go » (pay-as-you-go), sans gros engagement : un titre audio pèse environ 3 à 6 Mo,
+     donc 100 titres ≈ 0,5 Go. Une vidéo pèse beaucoup plus : elle consomme vite ton forfait ;
+   - un accès HTTP/HTTPS ou SOCKS5 avec identifiant + mot de passe (pas de liste blanche d'IP : l'adresse
+     de Render change) ;
+   - la possibilité de choisir un pays (France, Côte d'Ivoire… peu importe, une IP « normale » suffit) ;
+   - « rotating » (l'adresse change) ou « sticky » (elle reste quelques minutes) : les deux marchent, sticky est
+     un peu plus stable pour un téléchargement.
+   Évite : les proxys GRATUITS, les listes publiques et les proxys « datacenter » (même problème que Render).
+   Lis le prix par Go et les conditions sur le site du fournisseur avant de payer : je ne peux pas les vérifier.
+
+2) RÉCUPÉRER L'ADRESSE DU PROXY
+   Le fournisseur te donne : hôte, port, utilisateur, mot de passe. Assemble-les ainsi :
+       http://UTILISATEUR:MOT_DE_PASSE@HOTE:PORT
+   SOCKS5 : socks5://UTILISATEUR:MOT_DE_PASSE@HOTE:PORT
+   Si le mot de passe contient @ : # / ? % ou un espace, remplace chaque caractère par son code :
+   @ = %40   # = %23   / = %2F   ? = %3F   % = %25   espace = %20
+
+3) LE METTRE SUR RENDER
+   Render > ton service > Environment > « Add Environment Variable » :
+       Nom :    YTDLP_PROXY
+       Valeur : l'adresse de l'étape 2
+   Enregistre : Render redémarre tout seul. NE COLLE JAMAIS cette adresse dans une conversation,
+   dans GitHub ou dans une capture d'écran : elle contient ton mot de passe.
+
+4) VÉRIFIER (dans Telegram, avec le bot de Render)
+   /testproxy       -> doit afficher « Proxy joignable », une adresse, un pays et un réseau de particulier.
+                       Si un ⚠️ dit « ressemble à un serveur » : ce n'est pas un vrai résidentiel, demande
+                       un autre type de proxy.
+   /testdl hOiHshb3BKs  -> teste un vrai téléchargement.
+   Puis demande un titre au bot (« Niska Versus »).
+   /diag montre « proxy http://hote:port » (sans ton mot de passe).
+
+5) SI ÇA NE MARCHE PAS
+   - /testproxy dit « 407 » : identifiants faux ou forfait épuisé.
+   - /testproxy dit « Impossible de joindre » : mauvais hôte/port, ou le fournisseur exige une autre option.
+   - /testproxy est vert mais /testdl échoue : YouTube bloque aussi cette adresse (rare avec du résidentiel).
+     Essaie un autre pays ou un proxy mobile, et envoie un cookies.txt au bot (compte Google SECONDAIRE).
+   Envoie-moi seulement le texte des messages d'erreur, jamais l'adresse du proxy.
+
+6) POUR LIMITER LA FACTURE
+   - Évite les vidéos et les albums complets au début : l'audio d'un titre coûte peu, une vidéo coûte beaucoup.
+   - Les titres déjà téléchargés sont gardés par Telegram : les redemander ne consomme rien.
+   - Coupe le proxy (supprime YTDLP_PROXY) quand tu n'en as pas besoin.

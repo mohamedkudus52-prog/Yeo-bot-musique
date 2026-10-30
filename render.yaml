@@ -1,0 +1,23 @@
+# Plan de déploiement Render (facultatif) : « New + » > « Blueprint » > choisis ton dépôt GitHub.
+services:
+  - type: web
+    name: teo-bot
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: BOT_TOKEN          # jeton BotFather : à coller dans Render, jamais dans GitHub
+        sync: false
+      - key: OWNER_IDS          # ton identifiant Telegram
+        sync: false
+      - key: BACKUP_CHAT_ID     # même identifiant : la sauvegarde arrive dans ta conversation avec le bot
+        sync: false
+      - key: FORCE_IPV4         # YouTube juge l'IPv6 des serveurs plus sévèrement
+        value: "1"
+      - key: YTDLP_NIGHTLY
+        value: "1"
+      - key: MAX_DL
+        value: "2"
+      - key: DL_BUDGET
+        value: "75"
